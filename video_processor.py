@@ -210,6 +210,9 @@ class FrameMetric:
     is_anomaly:       bool
 
 
+_PHASE_LABELS = {"LKF": "왼무릎 최전방", "RKF": "오른무릎 최전방"}
+
+
 def _stats(vals: list) -> Optional[dict]:
     valid = [v for v in vals if v is not None]
     if not valid:
@@ -219,20 +222,37 @@ def _stats(vals: list) -> Optional[dict]:
             "min": float(arr.min()), "max": float(arr.max())}
 
 
-def compute_aggregate(frames: list[FrameMetric]) -> dict:
+def compute_phase_metrics(frames: list[FrameMetric]) -> dict:
     if not frames:
         return {}
-    anomaly_rate = sum(1 for f in frames if f.is_anomaly) / len(frames)
+
+    overall_anomaly = sum(1 for f in frames if f.is_anomaly) / len(frames)
+
+    phase_groups: dict[str, list[FrameMetric]] = {}
+    for f in frames:
+        if f.phase in _PHASE_LABELS:
+            phase_groups.setdefault(f.phase, []).append(f)
+
+    by_phase: dict[str, dict] = {}
+    for phase_str, pfms in phase_groups.items():
+        by_phase[phase_str] = {
+            "label":            _PHASE_LABELS[phase_str],
+            "frame_count":      len(pfms),
+            "knee_angle_left":  _stats([f.knee_angle_left  for f in pfms]),
+            "knee_angle_right": _stats([f.knee_angle_right for f in pfms]),
+            "hip_angle_left":   _stats([f.hip_angle_left   for f in pfms]),
+            "hip_angle_right":  _stats([f.hip_angle_right  for f in pfms]),
+            "torso_lean":       _stats([f.torso_lean        for f in pfms]),
+            "arm_swing_left":   _stats([f.arm_swing_left   for f in pfms]),
+            "arm_swing_right":  _stats([f.arm_swing_right  for f in pfms]),
+        }
+
     return {
-        "frame_count":      len(frames),
-        "anomaly_rate":     round(anomaly_rate, 3),
-        "knee_angle_left":  _stats([f.knee_angle_left  for f in frames]),
-        "knee_angle_right": _stats([f.knee_angle_right for f in frames]),
-        "hip_angle_left":   _stats([f.hip_angle_left   for f in frames]),
-        "hip_angle_right":  _stats([f.hip_angle_right  for f in frames]),
-        "torso_lean":       _stats([f.torso_lean        for f in frames]),
-        "arm_swing_left":   _stats([f.arm_swing_left   for f in frames]),
-        "arm_swing_right":  _stats([f.arm_swing_right  for f in frames]),
+        "overall":  {
+            "frame_count":  len(frames),
+            "anomaly_rate": round(overall_anomaly, 3),
+        },
+        "by_phase": by_phase,
     }
 
 
@@ -318,7 +338,7 @@ def process_video(
     estimator.close()
 
     # ── 스무딩 ─────────────────────────────────────────────────────
-    smoothed_landmarks = _ema_landmarks(raw_landmarks, alpha=0.5)
+    smoothed_landmarks = _ema_landmarks(raw_landmarks, alpha=0.7)
 
     # ── 보행 단계 감지 ──────────────────────────────────────────────
     phase_detector = GaitPhaseDetector(fps=fps)
@@ -350,11 +370,14 @@ def process_video(
             frame_scores.append({})
 
     # ── 집계 메트릭 ─────────────────────────────────────────────────
-    metrics = compute_aggregate(frame_metrics)
+    metrics = compute_phase_metrics(frame_metrics)
 
     def _mean(key):
-        s = metrics.get(key)
-        return s["mean"] if s else None
+        for ps in metrics.get("by_phase", {}).values():
+            s = ps.get(key)
+            if s:
+                return s["mean"]
+        return None
 
     # 렌더링용 대표 피처 (전체 평균)
     import time as _t
@@ -372,7 +395,7 @@ def process_video(
         timestamp=_t.time(),
     ) if frame_metrics else None
 
-    last_anomaly = (metrics.get("anomaly_rate", 0) > 0.2) if metrics else False
+    last_anomaly = (metrics.get("overall", {}).get("anomaly_rate", 0) > 0.5) if metrics else False
 
     # ── Pass 2: 렌더링 ──────────────────────────────────────────────
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -408,16 +431,44 @@ def process_video(
     # ── 단계별 피드백 생성 ──────────────────────────────────────────
     feedback_msgs = []
     if frame_metrics:
-        # 단계별 평균 피처 계산
         phase_frames: dict[str, list[FrameMetric]] = {}
         for fm in frame_metrics:
             phase_frames.setdefault(fm.phase, []).append(fm)
 
-        def phase_mean(fms: list[FrameMetric], key: str) -> Optional[float]:
-            vals = [getattr(fm, key) for fm in fms if getattr(fm, key) is not None]
-            return float(np.mean(vals)) if vals else None
+        from anomaly_detector import AnomalyResult, NORMAL_RANGES, _get_range
 
-        from anomaly_detector import AnomalyResult
+        _FEATURE_KEYS = {
+            "knee_angle": [("knee_angle_left", "left"), ("knee_angle_right", "right")],
+            "hip_angle":  [("hip_angle_left",  None),  ("hip_angle_right",  None)],
+            "torso_lean": [("torso_lean",       None)],
+            "arm_swing":  [("arm_swing_left",   None),  ("arm_swing_right",  None)],
+        }
+
+        def _worst_ts(fms: list[FrameMetric], feature: str, phase: GaitPhase) -> Optional[float]:
+            """피처 이탈이 가장 심한 프레임의 타임스탬프 반환."""
+            worst_dev, worst_ts = 0.0, None
+            for key, side in _FEATURE_KEYS.get(feature, []):
+                lo, hi = _get_range(feature, phase, side)
+                for fm in fms:
+                    val = getattr(fm, key, None)
+                    if val is None:
+                        continue
+                    dev = max(0.0, lo - val, val - hi)
+                    if dev > worst_dev:
+                        worst_dev, worst_ts = dev, fm.timestamp
+            return worst_ts if worst_dev >= 5.0 else None
+
+        def _worst_val(fms: list[FrameMetric], key: str, phase: GaitPhase, side: str = None) -> Optional[float]:
+            """이탈이 가장 심한 값 반환. 이탈 없으면 평균 반환."""
+            vals = [getattr(fm, key) for fm in fms if getattr(fm, key) is not None]
+            if not vals:
+                return None
+            feat = key.rsplit("_left", 1)[0].rsplit("_right", 1)[0]  # "knee_angle_left" → "knee_angle"
+            lo, hi = _get_range(feat, phase, side)
+            # 이탈 크기 기준으로 정렬 후 가장 심한 값 선택
+            def dev(v): return max(0.0, lo - v, v - hi)
+            worst = max(vals, key=dev)
+            return float(worst) if dev(worst) >= 5.0 else float(np.mean(vals))
 
         seen: set[str] = set()
         for phase_str, pfms in sorted(phase_frames.items()):
@@ -427,13 +478,13 @@ def process_video(
                 continue
 
             pf = RF(
-                knee_angle_left=phase_mean(pfms, "knee_angle_left"),
-                knee_angle_right=phase_mean(pfms, "knee_angle_right"),
-                hip_angle_left=phase_mean(pfms, "hip_angle_left"),
-                hip_angle_right=phase_mean(pfms, "hip_angle_right"),
-                torso_lean=phase_mean(pfms, "torso_lean"),
-                arm_swing_left=phase_mean(pfms, "arm_swing_left"),
-                arm_swing_right=phase_mean(pfms, "arm_swing_right"),
+                knee_angle_left=_worst_val(pfms, "knee_angle_left",  phase, "left"),
+                knee_angle_right=_worst_val(pfms, "knee_angle_right", phase, "right"),
+                hip_angle_left=_worst_val(pfms, "hip_angle_left",   phase),
+                hip_angle_right=_worst_val(pfms, "hip_angle_right",  phase),
+                torso_lean=_worst_val(pfms, "torso_lean",       phase),
+                arm_swing_left=_worst_val(pfms, "arm_swing_left",   phase),
+                arm_swing_right=_worst_val(pfms, "arm_swing_right",  phase),
                 cadence=0.0,
                 timestamp=_t.time(),
             )
@@ -446,11 +497,13 @@ def process_video(
                 key = f"{m.feature}:{m.level}:{m.message[:30]}"
                 if key not in seen:
                     seen.add(key)
+                    ts = _worst_ts(pfms, m.feature, phase)
                     feedback_msgs.append({
-                        "feature": m.feature,
-                        "level": m.level,
-                        "message": m.message,
+                        "feature":    m.feature,
+                        "level":      m.level,
+                        "message":    m.message,
                         "suggestion": m.suggestion,
+                        "timestamp":  round(ts, 3) if ts is not None else None,
                     })
 
         if not feedback_msgs:

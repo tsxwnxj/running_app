@@ -35,14 +35,14 @@ def _load_threshold(default: float = 0.5) -> float:
 # torso_lean  = shoulder→hip 벡터와 수직축 사이 각도: 5-10°
 # arm_swing   = ∠(Shoulder-Elbow-Wrist): 모든 단계 50-100°
 
-KNEE_FORWARD_RANGE  = (155.0, 170.0)
-KNEE_BACKWARD_RANGE = (50.0,  90.0)
+KNEE_FORWARD_RANGE  = (130.0, 167.0)  # 실측 ±5° 조정
+KNEE_BACKWARD_RANGE = (60.0,  160.0)
 
 NORMAL_RANGES: dict[str, tuple[float, float]] = {
-    "knee_angle": (50.0,  170.0),
-    "hip_angle":  (135.0, 155.0),
-    "torso_lean": (5.0,   10.0),
-    "arm_swing":  (50.0,  100.0),
+    "knee_angle": (60.0,  167.0),
+    "hip_angle":  (135.0, 171.0),
+    "torso_lean": (7.0,   13.0),
+    "arm_swing":  (75.0,  125.0),
 }
 
 AUTOENCODER_THRESHOLD = _load_threshold(default=0.5)
@@ -110,7 +110,9 @@ class AnomalyDetector:
         t = torch.from_numpy(norm_vec).unsqueeze(0)
         ae_error = float(self._model.reconstruction_error(t).item())
 
-        is_anomaly = len(violations) > 0 or ae_error > AUTOENCODER_THRESHOLD
+        # 이상감지율(anomaly_rate)은 AE 기준만 사용
+        # 규칙 기반 violations는 피드백 메시지 생성에만 활용
+        is_anomaly = ae_error > AUTOENCODER_THRESHOLD
         return AnomalyResult(
             is_anomaly=is_anomaly,
             ae_error=ae_error,
